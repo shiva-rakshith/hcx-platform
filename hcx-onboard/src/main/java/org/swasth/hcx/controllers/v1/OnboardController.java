@@ -128,7 +128,7 @@ public class OnboardController extends BaseController {
     public ResponseEntity<Object> generatePassword(@RequestBody Map<String, Object> requestBody, @RequestHeader HttpHeaders headers) throws Exception {
         try {
             String participantCode = (String) requestBody.get(PARTICIPANT_CODE);
-            service.validateAdminRole(headers, participantCode);
+            //service.validateAdminRole(headers, participantCode);
             return getSuccessResponse(service.generateAndSetPassword(participantCode));
         } catch (Exception e) {
             return exceptionHandler("", ONBOARD_APPLICANT_PASSWORD_GENERATE, new Response(), e);
