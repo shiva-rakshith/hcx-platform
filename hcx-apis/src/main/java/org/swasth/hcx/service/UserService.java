@@ -2,8 +2,15 @@ package org.swasth.hcx.service;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import kong.unirest.HttpResponse;
+import org.apache.commons.lang3.RandomStringUtils;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.commons.validator.routines.EmailValidator;
+import org.keycloak.admin.client.Keycloak;
+import org.keycloak.admin.client.KeycloakBuilder;
+import org.keycloak.admin.client.resource.RealmResource;
+import org.keycloak.admin.client.resource.UsersResource;
+import org.keycloak.representations.idm.CredentialRepresentation;
+import org.keycloak.representations.idm.UserRepresentation;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -19,6 +26,8 @@ import org.swasth.common.dto.ResponseError;
 import org.swasth.common.dto.Token;
 import org.swasth.common.exception.*;
 import org.swasth.common.utils.JSONUtils;
+import javax.annotation.PostConstruct;
+import javax.ws.rs.core.Response;
 import java.util.*;
 import java.util.concurrent.CompletableFuture;
 import java.util.stream.Collectors;
@@ -31,11 +40,30 @@ public class UserService extends BaseRegistryService {
     private static final Logger logger = LoggerFactory.getLogger(UserService.class);
     @Value("${registry.user-api-path}")
     private String registryUserPath;
+    @Value("${keycloak.base-url}")
+    private String keycloakURL;
+    @Value("${keycloak.admin-password}")
+    private String keycloakAdminPassword;
+    @Value("${keycloak.admin-user}")
+    private String keycloakAdminUserName;
+    @Value("${keycloak.master-realm}")
+    private String keycloakMasterRealm;
+    @Value("${keycloak.protocol-access-realm}")
+    private String keycloackProtocolAccessRealm;
+    @Value("${keycloak.admin-client-id}")
+    private String keycloackClientId;
+    @Value("${email.user-token-message}")
+    private String userEmailMessage;
+    @Value("${email.user-token-subject}")
+    private String emailSub;
     @Autowired
     private ParticipantService participantService;
+    @Autowired
+    private EmailService emailService;
 
     @Autowired
     protected AuditIndexer auditIndexer;
+    private Keycloak keycloak;
 
     public RegistryResponse create(Map<String, Object> requestBody, String code) throws Exception {
         HttpResponse<String> response = invite(requestBody, registryUserPath);
@@ -68,13 +96,13 @@ public class UserService extends BaseRegistryService {
         return responseHandler(response, code, USER);
     }
 
-    @Async
     public CompletableFuture<Map<String, Object>> processUser(Map<String, Object> requestBody, HttpHeaders headers, String action) {
         Map<String, Object> registryDetails = new HashMap<>();
         Map<String, Object> responseMap = new HashMap<>();
         CompletableFuture<Map<String, Object>> future = new CompletableFuture<>();
         try {
             HttpResponse<String> response;
+            Thread.sleep(1000);
             String userId = (String) requestBody.get(USER_ID);
             registryDetails = getUser(userId);
             Map<String, Object> finalRequest = new HashMap<>();
@@ -82,9 +110,13 @@ public class UserService extends BaseRegistryService {
                 ArrayList<Map<String, Object>> tenantRolesList = JSONUtils.convert(registryDetails.get(TENANT_ROLES), ArrayList.class);
                 if (StringUtils.equals(action, PARTICIPANT_USER_ADD)) {
                     userAdd(requestBody, finalRequest, tenantRolesList);
+                    addUserWithParticipant(userId,(String) requestBody.get(PARTICIPANT_CODE),(String) registryDetails.get(USER_NAME));
                 } else if (StringUtils.equals(action, PARTICIPANT_USER_REMOVE)) {
                     ArrayList<Map<String, Object>> filteredTenantRoles = new ArrayList<>();
                     userRemove(requestBody, finalRequest, tenantRolesList, filteredTenantRoles);
+                    if (ALLOWED_ROLES.contains((String) requestBody.get(ROLE))) {
+                        removeUserWithParticipant(userId, (String) requestBody.get(PARTICIPANT_CODE));
+                    }
                 }
                 response = update(finalRequest, registryDetails, registryUserPath);
                 generateAddRemoveUserAudit(userId, action, requestBody, getUserFromToken(headers));
@@ -117,7 +149,6 @@ public class UserService extends BaseRegistryService {
         finalRequest.put(TENANT_ROLES, filteredTenantRoles);
     }
 
-    @Async
     private void userAdd(Map<String, Object> requestBody, Map<String, Object> finalRequest, ArrayList<Map<String, Object>> tenantRolesList) throws ClientException {
         for (Map<String, Object> userExist : tenantRolesList) {
             if (userExist.get(ROLE).equals(requestBody.get(ROLE)) && userExist.get(PARTICIPANT_CODE).equals(requestBody.get(PARTICIPANT_CODE))) {
@@ -286,6 +317,68 @@ public class UserService extends BaseRegistryService {
         }
         filters.put("tenant_roles.participant_code", Map.of("or",organisations));
         return JSONUtils.serialize(requestBody);
+    }
+
+    public void addUserWithParticipant(String email, String participantCode, String name) throws ClientException {
+        try (Keycloak keycloak = Keycloak.getInstance(keycloakURL, keycloakMasterRealm, keycloakAdminUserName, keycloakAdminPassword, keycloackClientId)) {
+            RealmResource realmResource = keycloak.realm(keycloackProtocolAccessRealm);
+            UsersResource usersResource = realmResource.users();
+            String userName = String.format("%s:%s", participantCode, email);
+            List<UserRepresentation> existingUsers = usersResource.search(userName);
+            if (!existingUsers.isEmpty()) {
+                logger.info("User Id  : {} is already exists",email);
+            } else {
+                String password = generateRandomPassword();
+                UserRepresentation user = createUserRequest(userName, name, password);
+                Response response = usersResource.create(user);
+                if (response.getStatus() == 201) {
+                    userEmailMessage = userEmailMessage.replace("NAME", name).replace("USER_ID", email).replace("PASSWORD", password).replace("PARTICIPANT_CODE", participantCode);
+                    emailService.sendMail(email, emailSub, userEmailMessage);
+                    logger.info("user Id : {} is added to the keycloak record", email);
+                }
+            }
+        } catch (Exception e) {
+            throw new ClientException("Unable to add user and participant record to Keycloak: " + e.getMessage());
+        }
+    }
+
+    private UserRepresentation createUserRequest(String userName, String name, String password) {
+        UserRepresentation user = new UserRepresentation();
+        user.setUsername(userName);
+        user.setFirstName(name);
+        user.setEnabled(true);
+        Map<String, List<String>> attributes = new HashMap<>();
+        attributes.put("entity_name", List.of("api-access"));
+        user.setAttributes(attributes);
+        CredentialRepresentation credential = new CredentialRepresentation();
+        credential.setType(CredentialRepresentation.PASSWORD);
+        credential.setValue(password);
+        credential.setTemporary(false);
+        user.setCredentials(List.of(credential));
+        return user;
+    }
+
+    private String generateRandomPassword(){
+        String characters = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789@#&*";
+        return RandomStringUtils.random(16, characters);
+    }
+
+    public void removeUserWithParticipant(String email, String participantCode) throws ClientException {
+        try {
+            String userName = String.format("%s:%s", participantCode, email);
+            RealmResource realmResource = keycloak.realm(keycloackProtocolAccessRealm);
+            UsersResource usersResource = realmResource.users();
+            List<UserRepresentation> existingUsers = usersResource.search(userName);
+            if (existingUsers.isEmpty()) {
+                logger.info("user id {} does not exist in the keycloak",email);
+                return;
+            }
+            String userId = existingUsers.get(0).getId();
+            usersResource.get(userId).remove();
+            logger.info("user with user id : {} removed from the keycloak record", email);
+        } catch (Exception e) {
+            throw new ClientException(e.getMessage());
+        }
     }
 }
 
